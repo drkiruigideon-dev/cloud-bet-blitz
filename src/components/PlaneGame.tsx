@@ -6,26 +6,43 @@ import { supabase } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 
-type Phase = "idle" | "betting" | "flying" | "crashed" | "cashed";
+type Phase = "betting" | "flying" | "crashed" | "cashed";
 
-// Smooth multiplier curve: m(t) = e^(k*t) so it grows exponentially
+// Smooth multiplier curve: m(t) = e^(k*t)
 const GROWTH = 0.18; // per second
 const TICK_MS = 50;
+const BETTING_MS = 5000;
+const RESULT_MS = 3000;
+
+// Local crash generator (used when the user did not bet this round)
+function randomCrash(): number {
+  // Heavy-tailed; ~3% instant, otherwise 1.00x – ~20x
+  const r = Math.random();
+  if (r < 0.03) return 1.0;
+  const v = 1 / (1 - Math.random());
+  return Math.max(1.0, Math.min(50, Math.floor(v * 100) / 100));
+}
 
 export function PlaneGame() {
   const qc = useQueryClient();
-  const [phase, setPhase] = useState<Phase>("idle");
+  const [phase, setPhase] = useState<Phase>("betting");
   const [bet, setBet] = useState("10");
   const [multiplier, setMultiplier] = useState(1.0);
   const [crashPoint, setCrashPoint] = useState<number | null>(null);
   const [lastWin, setLastWin] = useState<{ amount: number; mult: number } | null>(null);
   const [history, setHistory] = useState<number[]>([]);
+  const [countdown, setCountdown] = useState(Math.ceil(BETTING_MS / 1000));
   const [busy, setBusy] = useState(false);
+  const [hasBet, setHasBet] = useState(false);
+  const [stakedAmount, setStakedAmount] = useState(0);
 
   const tickRef = useRef<number | null>(null);
+  const countdownRef = useRef<number | null>(null);
   const startRef = useRef<number>(0);
-  const cashedAtRef = useRef<number | null>(null);
   const crashRef = useRef<number>(0);
+  const hasBetRef = useRef(false);
+  const stakedRef = useRef(0);
+  const cashedRef = useRef<number | null>(null);
 
   // load recent crash history
   useEffect(() => {
@@ -39,84 +56,122 @@ export function PlaneGame() {
       });
   }, []);
 
-  const cleanup = useCallback(() => {
+  const clearTimers = useCallback(() => {
     if (tickRef.current) { window.clearInterval(tickRef.current); tickRef.current = null; }
+    if (countdownRef.current) { window.clearInterval(countdownRef.current); countdownRef.current = null; }
   }, []);
 
-  useEffect(() => () => cleanup(), [cleanup]);
+  useEffect(() => () => clearTimers(), [clearTimers]);
 
-  const tick = useCallback(() => {
-    const elapsed = (performance.now() - startRef.current) / 1000;
-    const m = Math.max(1, Math.exp(GROWTH * elapsed));
-    const rounded = Math.floor(m * 100) / 100;
-    setMultiplier(rounded);
-    if (rounded >= crashRef.current) {
-      cleanup();
-      finishRound(null);
+  // ============ Round loop ============
+  const startBetting = useCallback(() => {
+    clearTimers();
+    setPhase("betting");
+    setMultiplier(1);
+    setCrashPoint(null);
+    setLastWin(null);
+    setHasBet(false);
+    hasBetRef.current = false;
+    stakedRef.current = 0;
+    setStakedAmount(0);
+    cashedRef.current = null;
+
+    const start = performance.now();
+    setCountdown(Math.ceil(BETTING_MS / 1000));
+    countdownRef.current = window.setInterval(() => {
+      const remaining = BETTING_MS - (performance.now() - start);
+      if (remaining <= 0) {
+        clearTimers();
+        startFlying();
+      } else {
+        setCountdown(Math.ceil(remaining / 1000));
+      }
+    }, 100);
+  }, [clearTimers]);
+
+  const startFlying = useCallback(() => {
+    // If user didn't bet, generate a local crash for the visual round
+    if (!hasBetRef.current) {
+      crashRef.current = randomCrash();
     }
-  }, [cleanup]);
+    setPhase("flying");
+    setMultiplier(1);
+    startRef.current = performance.now();
+    tickRef.current = window.setInterval(() => {
+      const elapsed = (performance.now() - startRef.current) / 1000;
+      const m = Math.max(1, Math.exp(GROWTH * elapsed));
+      const rounded = Math.floor(m * 100) / 100;
+      setMultiplier(rounded);
+      if (rounded >= crashRef.current) {
+        clearTimers();
+        endRound(null);
+      }
+    }, TICK_MS);
+  }, [clearTimers]);
 
-  async function finishRound(cashed: number | null) {
-    cleanup();
+  async function endRound(cashedAt: number | null) {
+    clearTimers();
     const crash = crashRef.current;
+    setCrashPoint(crash);
     setHistory((h) => [crash, ...h].slice(0, 20));
-    if (cashed != null) {
+
+    if (cashedAt != null) {
       setPhase("cashed");
-      setLastWin({ amount: Number(bet) * cashed, mult: cashed });
+      setLastWin({ amount: stakedRef.current * cashedAt, mult: cashedAt });
     } else {
       setPhase("crashed");
       setLastWin(null);
     }
-    setBusy(true);
-    const { error } = await supabase.rpc("settle_round", {
-      _bet: Number(bet),
-      _crash: crash,
-      _cashed: cashed as number,
-    });
-    if (error) toast.error(error.message);
-    qc.invalidateQueries({ queryKey: ["wallet"] });
-    qc.invalidateQueries({ queryKey: ["history"] });
-    qc.invalidateQueries({ queryKey: ["leaderboard"] });
-    setBusy(false);
 
-    // reset to idle after 2.5s
-    window.setTimeout(() => {
-      setPhase("idle");
-      setMultiplier(1);
-      setCrashPoint(null);
-      cashedAtRef.current = null;
-    }, 2800);
+    // Only settle on the server if the user actually placed a bet
+    if (hasBetRef.current) {
+      const { error } = await supabase.rpc("settle_round", {
+        _bet: stakedRef.current,
+        _crash: crash,
+        _cashed: cashedAt as number,
+      });
+      if (error) toast.error(error.message);
+      qc.invalidateQueries({ queryKey: ["wallet"] });
+      qc.invalidateQueries({ queryKey: ["history"] });
+      qc.invalidateQueries({ queryKey: ["leaderboard"] });
+    }
+
+    window.setTimeout(startBetting, RESULT_MS);
   }
 
+  // Kick off the loop
+  useEffect(() => {
+    startBetting();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   async function placeBet() {
+    if (phase !== "betting" || hasBetRef.current) return;
     const amount = Number(bet);
     if (!amount || amount <= 0) return toast.error("Enter a valid bet");
     setBusy(true);
     const { data, error } = await supabase.rpc("place_bet", { _bet: amount });
     setBusy(false);
     if (error) return toast.error(error.message);
-    const crash = Number(data);
-    crashRef.current = crash;
-    setCrashPoint(crash);
-    cashedAtRef.current = null;
+    crashRef.current = Number(data);
+    hasBetRef.current = true;
+    stakedRef.current = amount;
+    setHasBet(true);
+    setStakedAmount(amount);
     qc.invalidateQueries({ queryKey: ["wallet"] });
-
-    setPhase("flying");
-    setMultiplier(1);
-    startRef.current = performance.now();
-    tickRef.current = window.setInterval(tick, TICK_MS);
+    toast.success(`Bet locked in for round`);
   }
 
   function cashOut() {
-    if (phase !== "flying") return;
-    cashedAtRef.current = multiplier;
-    finishRound(multiplier);
+    if (phase !== "flying" || !hasBetRef.current || cashedRef.current != null) return;
+    cashedRef.current = multiplier;
+    endRound(multiplier);
   }
 
   // plane position based on multiplier (visual curve)
-  const progress = Math.min(1, Math.log(multiplier) / Math.log(10));
-  const planeX = 8 + progress * 80; // % across
-  const planeY = 85 - progress * 70; // % from top (rises)
+  const progress = Math.min(1, Math.log(Math.max(1, multiplier)) / Math.log(10));
+  const planeX = 8 + progress * 80;
+  const planeY = 85 - progress * 70;
 
   return (
     <div className="space-y-4">
@@ -188,13 +243,23 @@ export function PlaneGame() {
           </div>
         </div>
 
-        {/* multiplier overlay */}
+        {/* overlay */}
         <div className="absolute inset-0 grid place-items-center pointer-events-none">
           <div className="text-center">
-            {phase === "idle" && (
+            {phase === "betting" && (
               <div className="space-y-2">
                 <Rocket className="h-12 w-12 mx-auto text-foreground/70" />
-                <p className="text-sm font-medium text-foreground/80 uppercase tracking-widest">Place your bet</p>
+                <p className="text-sm font-medium text-foreground/80 uppercase tracking-widest">
+                  Next round in
+                </p>
+                <p className="text-6xl sm:text-7xl font-bold tabular-nums text-foreground drop-shadow-2xl">
+                  {countdown}s
+                </p>
+                {hasBet && (
+                  <p className="text-sm font-semibold text-gold uppercase tracking-widest">
+                    Bet locked: {stakedAmount}
+                  </p>
+                )}
               </div>
             )}
             {(phase === "flying" || phase === "cashed" || phase === "crashed") && (
@@ -230,7 +295,7 @@ export function PlaneGame() {
             step="1"
             value={bet}
             onChange={(e) => setBet(e.target.value)}
-            disabled={phase === "flying"}
+            disabled={phase !== "betting" || hasBet}
             className="bg-transparent border-0 text-lg font-bold tabular-nums focus-visible:ring-0"
           />
           <div className="flex gap-1">
@@ -238,7 +303,7 @@ export function PlaneGame() {
               <button
                 key={v}
                 onClick={() => setBet(String(v))}
-                disabled={phase === "flying"}
+                disabled={phase !== "betting" || hasBet}
                 className="rounded-md bg-muted px-2.5 py-1 text-xs font-semibold hover:bg-accent disabled:opacity-40"
               >
                 {v}
@@ -246,7 +311,7 @@ export function PlaneGame() {
             ))}
             <button
               onClick={() => setBet((b) => String(Math.max(1, Math.floor(Number(b) * 2))))}
-              disabled={phase === "flying"}
+              disabled={phase !== "betting" || hasBet}
               className="rounded-md bg-muted px-2.5 py-1 text-xs font-semibold hover:bg-accent disabled:opacity-40"
             >
               2x
@@ -254,7 +319,7 @@ export function PlaneGame() {
           </div>
         </div>
 
-        {phase === "flying" ? (
+        {phase === "flying" && hasBet ? (
           <Button
             onClick={cashOut}
             disabled={busy}
@@ -262,15 +327,21 @@ export function PlaneGame() {
           >
             Cash out @ {multiplier.toFixed(2)}x
             <br />
-            <span className="text-sm opacity-80">+{(Number(bet) * multiplier).toFixed(2)}</span>
+            <span className="text-sm opacity-80">+{(stakedAmount * multiplier).toFixed(2)}</span>
           </Button>
         ) : (
           <Button
             onClick={placeBet}
-            disabled={busy || phase === "crashed" || phase === "cashed"}
-            className="h-auto py-4 px-8 text-lg font-bold bg-fire-gradient text-primary-foreground hover:opacity-90 shadow-glow"
+            disabled={busy || phase !== "betting" || hasBet}
+            className="h-auto py-4 px-8 text-lg font-bold bg-fire-gradient text-primary-foreground hover:opacity-90 shadow-glow disabled:opacity-60"
           >
-            {phase === "idle" ? "Place bet & fly" : "Next round…"}
+            {phase === "betting"
+              ? hasBet
+                ? "Bet locked"
+                : `Place bet (${countdown}s)`
+              : phase === "flying"
+                ? "Watching round…"
+                : "Next round soon…"}
           </Button>
         )}
       </div>
