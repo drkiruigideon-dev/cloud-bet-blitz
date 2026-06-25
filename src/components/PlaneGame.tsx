@@ -71,7 +71,7 @@ export function PlaneGame() {
     const { error } = await supabase.rpc("settle_round", {
       _bet: Number(bet),
       _crash: crash,
-      _cashed: cashed,
+      _cashed: cashed as number,
     });
     if (error) toast.error(error.message);
     qc.invalidateQueries({ queryKey: ["wallet"] });
