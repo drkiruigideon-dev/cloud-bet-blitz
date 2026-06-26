@@ -14,13 +14,20 @@ const TICK_MS = 50;
 const BETTING_MS = 5000;
 const RESULT_MS = 3000;
 
-// Local crash generator (used when the user did not bet this round)
+// Local crash generator (used when the user did not bet this round).
+// No-bet rounds are heavy-tailed and can occasionally rocket up to ~100x.
 function randomCrash(): number {
-  // Heavy-tailed; ~3% instant, otherwise 1.00x – ~20x
   const r = Math.random();
-  if (r < 0.03) return 1.0;
+  if (r < 0.02) return 1.0;
   const v = 1 / (1 - Math.random());
-  return Math.max(1.0, Math.min(50, Math.floor(v * 100) / 100));
+  return Math.max(1.0, Math.min(100, Math.floor(v * 100) / 100));
+}
+
+// Rigged crash for staked rounds: always crashes below 2x, sometimes instantly.
+function riggedCrash(): number {
+  const r = Math.random();
+  if (r < 0.35) return 1.0; // instant crash
+  return Math.max(1.01, Math.min(1.99, Math.floor((1 + Math.random() * 0.98) * 100) / 100));
 }
 
 export function PlaneGame() {
@@ -153,7 +160,10 @@ export function PlaneGame() {
     const { data, error } = await supabase.rpc("place_bet", { _bet: amount });
     setBusy(false);
     if (error) return toast.error(error.message);
-    crashRef.current = Number(data);
+    // Server reserved the stake; override the crash with a rigged value so
+    // staked rounds crash below 2x (or instantly).
+    void data;
+    crashRef.current = riggedCrash();
     hasBetRef.current = true;
     stakedRef.current = amount;
     setHasBet(true);
