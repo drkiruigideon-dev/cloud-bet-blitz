@@ -1,21 +1,18 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Plane, Rocket } from "lucide-react";
+import { Plane } from "lucide-react";
 import { toast } from "sonner";
 import { supabase } from "@/integrations/supabase/client";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
+import { LiveBets } from "@/components/LiveBets";
+import { BetPanel } from "@/components/BetPanel";
 
 type Phase = "betting" | "flying" | "crashed" | "cashed";
 
-// Smooth multiplier curve: m(t) = e^(k*t)
-const GROWTH = 0.18; // per second
+const GROWTH = 0.18;
 const TICK_MS = 50;
 const BETTING_MS = 5000;
 const RESULT_MS = 3000;
 
-// Local crash generator (used when the user did not bet this round).
-// No-bet rounds are heavy-tailed and can occasionally rocket up to ~100x.
 function randomCrash(): number {
   const r = Math.random();
   if (r < 0.02) return 1.0;
@@ -23,20 +20,17 @@ function randomCrash(): number {
   return Math.max(1.0, Math.min(100, Math.floor(v * 100) / 100));
 }
 
-// Rigged crash for staked rounds: always crashes below 2x, sometimes instantly.
 function riggedCrash(): number {
   const r = Math.random();
-  if (r < 0.35) return 1.0; // instant crash
+  if (r < 0.35) return 1.0;
   return Math.max(1.01, Math.min(1.99, Math.floor((1 + Math.random() * 0.98) * 100) / 100));
 }
 
 export function PlaneGame() {
   const qc = useQueryClient();
   const [phase, setPhase] = useState<Phase>("betting");
-  const [bet, setBet] = useState("10");
   const [multiplier, setMultiplier] = useState(1.0);
   const [crashPoint, setCrashPoint] = useState<number | null>(null);
-  const [lastWin, setLastWin] = useState<{ amount: number; mult: number } | null>(null);
   const [history, setHistory] = useState<number[]>([]);
   const [countdown, setCountdown] = useState(Math.ceil(BETTING_MS / 1000));
   const [busy, setBusy] = useState(false);
@@ -51,13 +45,12 @@ export function PlaneGame() {
   const stakedRef = useRef(0);
   const cashedRef = useRef<number | null>(null);
 
-  // load recent crash history
   useEffect(() => {
     supabase
       .from("rounds")
       .select("crash_point")
       .order("created_at", { ascending: false })
-      .limit(20)
+      .limit(24)
       .then(({ data }) => {
         if (data) setHistory(data.map((r) => Number(r.crash_point)));
       });
@@ -70,13 +63,11 @@ export function PlaneGame() {
 
   useEffect(() => () => clearTimers(), [clearTimers]);
 
-  // ============ Round loop ============
   const startBetting = useCallback(() => {
     clearTimers();
     setPhase("betting");
     setMultiplier(1);
     setCrashPoint(null);
-    setLastWin(null);
     setHasBet(false);
     hasBetRef.current = false;
     stakedRef.current = 0;
@@ -97,10 +88,7 @@ export function PlaneGame() {
   }, [clearTimers]);
 
   const startFlying = useCallback(() => {
-    // If user didn't bet, generate a local crash for the visual round
-    if (!hasBetRef.current) {
-      crashRef.current = randomCrash();
-    }
+    if (!hasBetRef.current) crashRef.current = randomCrash();
     setPhase("flying");
     setMultiplier(1);
     startRef.current = performance.now();
@@ -120,17 +108,11 @@ export function PlaneGame() {
     clearTimers();
     const crash = crashRef.current;
     setCrashPoint(crash);
-    setHistory((h) => [crash, ...h].slice(0, 20));
+    setHistory((h) => [crash, ...h].slice(0, 24));
 
-    if (cashedAt != null) {
-      setPhase("cashed");
-      setLastWin({ amount: stakedRef.current * cashedAt, mult: cashedAt });
-    } else {
-      setPhase("crashed");
-      setLastWin(null);
-    }
+    if (cashedAt != null) setPhase("cashed");
+    else setPhase("crashed");
 
-    // Only settle on the server if the user actually placed a bet
     if (hasBetRef.current) {
       const { error } = await supabase.rpc("settle_round", {
         _bet: stakedRef.current,
@@ -146,30 +128,25 @@ export function PlaneGame() {
     window.setTimeout(startBetting, RESULT_MS);
   }
 
-  // Kick off the loop
   useEffect(() => {
     startBetting();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function placeBet() {
+  async function placeBet(amount: number) {
     if (phase !== "betting" || hasBetRef.current) return;
-    const amount = Number(bet);
     if (!amount || amount <= 0) return toast.error("Enter a valid bet");
     setBusy(true);
-    const { data, error } = await supabase.rpc("place_bet", { _bet: amount });
+    const { error } = await supabase.rpc("place_bet", { _bet: amount });
     setBusy(false);
     if (error) return toast.error(error.message);
-    // Server reserved the stake; override the crash with a rigged value so
-    // staked rounds crash below 2x (or instantly).
-    void data;
     crashRef.current = riggedCrash();
     hasBetRef.current = true;
     stakedRef.current = amount;
     setHasBet(true);
     setStakedAmount(amount);
     qc.invalidateQueries({ queryKey: ["wallet"] });
-    toast.success(`Bet locked in for round`);
+    toast.success(`Bet locked: ${amount}`);
   }
 
   function cashOut() {
@@ -178,182 +155,173 @@ export function PlaneGame() {
     endRound(multiplier);
   }
 
-  // plane position based on multiplier (visual curve)
+  // plane position
   const progress = Math.min(1, Math.log(Math.max(1, multiplier)) / Math.log(10));
   const planeX = 8 + progress * 80;
   const planeY = 85 - progress * 70;
 
+  const multiplierColor =
+    phase === "crashed" ? "text-loss" : phase === "cashed" ? "text-win" : "text-foreground";
+
   return (
-    <div className="space-y-4">
-      {/* Recent crashes */}
-      <div className="flex gap-1.5 overflow-x-auto pb-1 scrollbar-none">
-        {history.map((c, i) => (
-          <span
-            key={i}
-            className={`shrink-0 rounded-md px-2 py-1 text-xs font-bold tabular-nums ${
-              c >= 2 ? "bg-win/20 text-win" : c >= 1.5 ? "bg-gold/20 text-gold" : "bg-loss/20 text-loss"
-            }`}
-          >
-            {c.toFixed(2)}x
-          </span>
-        ))}
+    <div className="grid grid-cols-1 lg:grid-cols-[280px_1fr] gap-3 lg:h-[calc(100vh-120px)]">
+      {/* Left: live bets */}
+      <div className="hidden lg:block min-h-0">
+        <LiveBets />
       </div>
 
-      {/* Game screen */}
-      <div className="relative overflow-hidden rounded-3xl border border-border bg-sky-gradient shadow-card aspect-[16/10] sm:aspect-[16/8]">
-        {/* sun */}
-        <div className="absolute right-[15%] top-[55%] h-32 w-32 rounded-full bg-gold-gradient blur-2xl opacity-70" />
-        <div className="absolute right-[18%] top-[58%] h-20 w-20 rounded-full bg-gold-gradient opacity-90" />
-
-        {/* clouds */}
-        <div className="absolute inset-0 pointer-events-none opacity-30">
-          <div className="absolute top-[20%] left-[10%] h-8 w-24 bg-white/40 blur-md rounded-full" />
-          <div className="absolute top-[35%] left-[60%] h-6 w-20 bg-white/30 blur-md rounded-full" />
-          <div className="absolute top-[15%] left-[75%] h-5 w-16 bg-white/30 blur-md rounded-full" />
-        </div>
-
-        {/* trail */}
-        {(phase === "flying" || phase === "cashed" || phase === "crashed") && (
-          <svg className="absolute inset-0 h-full w-full" preserveAspectRatio="none" viewBox="0 0 100 100">
-            <defs>
-              <linearGradient id="trail" x1="0%" y1="100%" x2="100%" y2="0%">
-                <stop offset="0%" stopColor="oklch(0.72 0.22 0)" stopOpacity="0" />
-                <stop offset="100%" stopColor="oklch(0.85 0.16 85)" stopOpacity="1" />
-              </linearGradient>
-            </defs>
-            <path
-              d={`M 8 85 Q ${planeX * 0.5} 85 ${planeX} ${planeY}`}
-              fill="none"
-              stroke="url(#trail)"
-              strokeWidth="0.8"
-              strokeLinecap="round"
-            />
-          </svg>
-        )}
-
-        {/* plane */}
-        <div
-          className="absolute transition-none"
-          style={{
-            left: `${planeX}%`,
-            top: `${planeY}%`,
-            transform: "translate(-50%, -50%)",
-          }}
-        >
-          <div className="relative">
-            {phase === "flying" && (
-              <div className="absolute -left-3 top-1/2 -translate-y-1/2 h-2 w-4 bg-fire-gradient rounded-full blur-sm animate-flame" />
-            )}
-            <Plane
-              className={`h-10 w-10 sm:h-12 sm:w-12 drop-shadow-2xl ${
-                phase === "crashed" ? "text-loss rotate-90" : "text-foreground -rotate-45"
-              } transition-transform duration-300`}
-              strokeWidth={2}
-            />
-          </div>
-        </div>
-
-        {/* overlay */}
-        <div className="absolute inset-0 grid place-items-center pointer-events-none">
-          <div className="text-center">
-            {phase === "betting" && (
-              <div className="space-y-2">
-                <Rocket className="h-12 w-12 mx-auto text-foreground/70" />
-                <p className="text-sm font-medium text-foreground/80 uppercase tracking-widest">
-                  Next round in
-                </p>
-                <p className="text-6xl sm:text-7xl font-bold tabular-nums text-foreground drop-shadow-2xl">
-                  {countdown}s
-                </p>
-                {hasBet && (
-                  <p className="text-sm font-semibold text-gold uppercase tracking-widest">
-                    Bet locked: {stakedAmount}
-                  </p>
-                )}
-              </div>
-            )}
-            {(phase === "flying" || phase === "cashed" || phase === "crashed") && (
-              <div
-                className={`font-bold tabular-nums text-6xl sm:text-8xl tracking-tighter drop-shadow-2xl ${
-                  phase === "crashed" ? "text-loss" : phase === "cashed" ? "text-win" : "text-foreground"
-                }`}
-              >
-                {multiplier.toFixed(2)}<span className="text-4xl sm:text-6xl">x</span>
-              </div>
-            )}
-            {phase === "crashed" && (
-              <p className="mt-2 text-xl font-bold text-loss uppercase tracking-widest animate-float-up">
-                Crashed @ {crashPoint?.toFixed(2)}x
-              </p>
-            )}
-            {phase === "cashed" && lastWin && (
-              <p className="mt-2 text-xl font-bold text-win animate-float-up">
-                +{lastWin.amount.toFixed(2)} won!
-              </p>
-            )}
-          </div>
-        </div>
-      </div>
-
-      {/* Controls */}
-      <div className="grid grid-cols-1 sm:grid-cols-[1fr_auto] gap-3">
-        <div className="glass rounded-2xl p-3 flex items-center gap-2">
-          <span className="text-xs uppercase tracking-widest text-muted-foreground px-2">Bet</span>
-          <Input
-            type="number"
-            min="1"
-            step="1"
-            value={bet}
-            onChange={(e) => setBet(e.target.value)}
-            disabled={phase !== "betting" || hasBet}
-            className="bg-transparent border-0 text-lg font-bold tabular-nums focus-visible:ring-0"
-          />
-          <div className="flex gap-1">
-            {[10, 50, 100].map((v) => (
-              <button
-                key={v}
-                onClick={() => setBet(String(v))}
-                disabled={phase !== "betting" || hasBet}
-                className="rounded-md bg-muted px-2.5 py-1 text-xs font-semibold hover:bg-accent disabled:opacity-40"
-              >
-                {v}
-              </button>
-            ))}
-            <button
-              onClick={() => setBet((b) => String(Math.max(1, Math.floor(Number(b) * 2))))}
-              disabled={phase !== "betting" || hasBet}
-              className="rounded-md bg-muted px-2.5 py-1 text-xs font-semibold hover:bg-accent disabled:opacity-40"
+      {/* Right: history strip + game + controls */}
+      <div className="flex flex-col gap-3 min-h-0">
+        {/* Recent crashes strip */}
+        <div className="flex gap-1.5 overflow-x-auto pb-1 scrollbar-none px-1">
+          {history.map((c, i) => (
+            <span
+              key={i}
+              className={`shrink-0 text-xs font-bold tabular-nums ${
+                c >= 2 ? "text-win" : c >= 1.5 ? "text-gold" : "text-loss"
+              }`}
             >
-              2x
-            </button>
+              {c.toFixed(2)}x
+            </span>
+          ))}
+        </div>
+
+        {/* Game screen — dark sunburst */}
+        <div className="relative overflow-hidden rounded-3xl border border-border bg-background shadow-card aspect-[16/10] sm:aspect-[16/8]">
+          {/* radial sunburst rays */}
+          <div className="absolute inset-0 pointer-events-none">
+            <div
+              className="absolute inset-0 opacity-60"
+              style={{
+                background:
+                  "repeating-conic-gradient(from 0deg at 50% 100%, oklch(0.25 0.1 305) 0deg 6deg, transparent 6deg 12deg)",
+              }}
+            />
+            <div
+              className="absolute inset-0"
+              style={{
+                background:
+                  "radial-gradient(ellipse at 50% 80%, oklch(0.4 0.18 280 / 0.55), transparent 60%)",
+              }}
+            />
+          </div>
+
+          {/* trail */}
+          {(phase === "flying" || phase === "cashed" || phase === "crashed") && (
+            <svg className="absolute inset-0 h-full w-full" preserveAspectRatio="none" viewBox="0 0 100 100">
+              <defs>
+                <linearGradient id="trail" x1="0%" y1="100%" x2="100%" y2="0%">
+                  <stop offset="0%" stopColor="oklch(0.72 0.22 0)" stopOpacity="0.1" />
+                  <stop offset="100%" stopColor="oklch(0.72 0.22 0)" stopOpacity="0.9" />
+                </linearGradient>
+                <linearGradient id="trailFill" x1="0%" y1="100%" x2="100%" y2="0%">
+                  <stop offset="0%" stopColor="oklch(0.72 0.22 0)" stopOpacity="0.25" />
+                  <stop offset="100%" stopColor="oklch(0.72 0.22 0)" stopOpacity="0.05" />
+                </linearGradient>
+              </defs>
+              <path
+                d={`M 8 85 Q ${planeX * 0.5} 85 ${planeX} ${planeY} L ${planeX} 100 L 8 100 Z`}
+                fill="url(#trailFill)"
+              />
+              <path
+                d={`M 8 85 Q ${planeX * 0.5} 85 ${planeX} ${planeY}`}
+                fill="none"
+                stroke="url(#trail)"
+                strokeWidth="0.9"
+                strokeLinecap="round"
+              />
+            </svg>
+          )}
+
+          {/* plane */}
+          {(phase === "flying" || phase === "cashed" || phase === "crashed") && (
+            <div
+              className="absolute"
+              style={{ left: `${planeX}%`, top: `${planeY}%`, transform: "translate(-50%, -50%)" }}
+            >
+              <Plane
+                className={`h-12 w-12 sm:h-14 sm:w-14 drop-shadow-2xl ${
+                  phase === "crashed" ? "text-loss rotate-90" : "text-primary -rotate-45"
+                } transition-transform duration-300`}
+                strokeWidth={2.2}
+                fill="currentColor"
+              />
+            </div>
+          )}
+
+          {/* center overlay */}
+          <div className="absolute inset-0 grid place-items-center pointer-events-none">
+            <div className="text-center">
+              {phase === "betting" && (
+                <div className="space-y-2">
+                  <p className="text-xs font-medium text-muted-foreground uppercase tracking-[0.3em]">
+                    Next round in
+                  </p>
+                  <p className="text-6xl sm:text-8xl font-black tabular-nums text-gradient-fire drop-shadow-2xl">
+                    {countdown}s
+                  </p>
+                  {hasBet && (
+                    <p className="text-xs font-semibold text-gold uppercase tracking-widest">
+                      Bet locked: {stakedAmount}
+                    </p>
+                  )}
+                </div>
+              )}
+              {(phase === "flying" || phase === "cashed" || phase === "crashed") && (
+                <div className={`font-black tabular-nums text-7xl sm:text-9xl tracking-tighter drop-shadow-2xl ${multiplierColor}`}>
+                  {multiplier.toFixed(2)}
+                  <span className="text-5xl sm:text-7xl">x</span>
+                </div>
+              )}
+              {phase === "crashed" && (
+                <p className="mt-3 text-base sm:text-lg font-bold text-loss uppercase tracking-[0.3em] animate-float-up">
+                  Flew Away!
+                </p>
+              )}
+              {phase === "cashed" && (
+                <p className="mt-3 text-base sm:text-lg font-bold text-win uppercase tracking-[0.3em] animate-float-up">
+                  Cashed Out
+                </p>
+              )}
+            </div>
+          </div>
+
+          {/* corner balance pill (mimics reference) */}
+          <div className="absolute bottom-3 right-3 glass rounded-full px-3 py-1 text-xs font-bold tabular-nums">
+            {crashPoint ? `Last ${crashPoint.toFixed(2)}x` : "—"}
           </div>
         </div>
 
-        {phase === "flying" && hasBet ? (
-          <Button
-            onClick={cashOut}
-            disabled={busy}
-            className="h-auto py-4 px-8 text-lg font-bold bg-gold-gradient text-gold-foreground hover:opacity-90 shadow-gold-glow animate-pulse-glow"
-          >
-            Cash out @ {multiplier.toFixed(2)}x
-            <br />
-            <span className="text-sm opacity-80">+{(stakedAmount * multiplier).toFixed(2)}</span>
-          </Button>
-        ) : (
-          <Button
-            onClick={placeBet}
-            disabled={busy || phase !== "betting" || hasBet}
-            className="h-auto py-4 px-8 text-lg font-bold bg-fire-gradient text-primary-foreground hover:opacity-90 shadow-glow disabled:opacity-60"
-          >
-            {phase === "betting"
-              ? hasBet
-                ? "Bet locked"
-                : `Place bet (${countdown}s)`
-              : phase === "flying"
-                ? "Watching round…"
-                : "Next round soon…"}
-          </Button>
-        )}
+        {/* Dual bet panels */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <BetPanel
+            id="panel-1"
+            phase={phase}
+            hasBet={hasBet}
+            busy={busy}
+            countdown={countdown}
+            multiplier={multiplier}
+            stakedAmount={stakedAmount}
+            onPlace={placeBet}
+            onCashOut={cashOut}
+          />
+          <BetPanel
+            id="panel-2"
+            phase={phase}
+            hasBet={hasBet}
+            busy={busy}
+            countdown={countdown}
+            multiplier={multiplier}
+            stakedAmount={stakedAmount}
+            onPlace={placeBet}
+            onCashOut={cashOut}
+          />
+        </div>
+
+        {/* Mobile live bets */}
+        <div className="lg:hidden">
+          <LiveBets />
+        </div>
       </div>
     </div>
   );
