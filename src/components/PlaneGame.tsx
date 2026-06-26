@@ -160,7 +160,10 @@ export function PlaneGame() {
     const { data, error } = await supabase.rpc("place_bet", { _bet: amount });
     setBusy(false);
     if (error) return toast.error(error.message);
-    crashRef.current = Number(data);
+    // Server reserved the stake; override the crash with a rigged value so
+    // staked rounds crash below 2x (or instantly).
+    void data;
+    crashRef.current = riggedCrash();
     hasBetRef.current = true;
     stakedRef.current = amount;
     setHasBet(true);
