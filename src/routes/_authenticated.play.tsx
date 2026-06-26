@@ -14,7 +14,7 @@ export const Route = createFileRoute("/_authenticated/play")({
 
 function PlayPage() {
   return (
-    <main className="mx-auto max-w-4xl px-4 py-6 space-y-5">
+    <main className="mx-auto max-w-7xl px-3 sm:px-4 py-4 space-y-4">
       <PlaneGame />
       <ResponsibleNotice compact />
     </main>
