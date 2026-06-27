@@ -18,37 +18,25 @@ function Leaderboard() {
   const { data: topWinners } = useQuery({
     queryKey: ["leaderboard", "winners"],
     queryFn: async () => {
-      const { data: rounds } = await supabase
-        .from("rounds")
-        .select("user_id, payout, bet")
-        .eq("status", "won")
-        .order("created_at", { ascending: false })
-        .limit(500);
-      const totals = new Map<string, number>();
-      (rounds ?? []).forEach((r) => {
-        totals.set(r.user_id, (totals.get(r.user_id) ?? 0) + (Number(r.payout) - Number(r.bet)));
-      });
-      const top = [...totals.entries()].sort((a, b) => b[1] - a[1]).slice(0, 20);
-      const ids = top.map(([id]) => id);
-      const { data: profiles } = await supabase.from("profiles").select("id, display_name, username").in("id", ids);
-      const map = new Map((profiles ?? []).map((p) => [p.id, p]));
-      return top.map(([id, profit]) => ({ id, profit, profile: map.get(id) }));
+      const { data } = await supabase.rpc("leaderboard_top_profit");
+      return (data ?? []).map((r: any) => ({
+        id: r.user_id as string,
+        profit: Number(r.profit),
+        profile: { display_name: r.display_name, username: r.username },
+      }));
     },
   });
 
   const { data: bigWins } = useQuery({
     queryKey: ["leaderboard", "big"],
     queryFn: async () => {
-      const { data } = await supabase
-        .from("rounds")
-        .select("id, user_id, bet, cashed_out_at, payout, created_at")
-        .eq("status", "won")
-        .order("cashed_out_at", { ascending: false })
-        .limit(10);
-      const ids = [...new Set((data ?? []).map((r) => r.user_id))];
-      const { data: profiles } = await supabase.from("profiles").select("id, display_name, username").in("id", ids);
-      const map = new Map((profiles ?? []).map((p) => [p.id, p]));
-      return (data ?? []).map((r) => ({ ...r, profile: map.get(r.user_id) }));
+      const { data } = await supabase.rpc("leaderboard_big_wins");
+      return (data ?? []).map((r: any) => ({
+        id: r.id as string,
+        cashed_out_at: r.cashed_out_at as number,
+        payout: r.payout as number,
+        profile: { display_name: r.display_name, username: r.username },
+      }));
     },
   });
 
