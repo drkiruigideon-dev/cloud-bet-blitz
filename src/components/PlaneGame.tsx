@@ -99,7 +99,7 @@ export function PlaneGame() {
       setMultiplier(rounded);
       if (rounded >= crashRef.current) {
         clearTimers();
-        endRound(null);
+        endRound(cashedRef.current);
       }
     }, TICK_MS);
   }, [clearTimers]);
@@ -110,20 +110,9 @@ export function PlaneGame() {
     setCrashPoint(crash);
     setHistory((h) => [crash, ...h].slice(0, 24));
 
-    if (cashedAt != null) setPhase("cashed");
-    else setPhase("crashed");
+    // If the player cashed out, show "cashed" briefly; otherwise show crash.
+    setPhase(cashedAt != null ? "cashed" : "crashed");
 
-    if (hasBetRef.current) {
-      const { error } = await supabase.rpc("settle_round", {
-        _bet: stakedRef.current,
-        _crash: crash,
-        _cashed: cashedAt as number,
-      });
-      if (error) toast.error(error.message);
-      qc.invalidateQueries({ queryKey: ["wallet"] });
-      qc.invalidateQueries({ queryKey: ["history"] });
-      qc.invalidateQueries({ queryKey: ["leaderboard"] });
-    }
 
     window.setTimeout(startBetting, RESULT_MS);
   }
