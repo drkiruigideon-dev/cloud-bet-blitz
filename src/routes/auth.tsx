@@ -18,11 +18,20 @@ export const Route = createFileRoute("/auth")({
   component: AuthPage,
 });
 
-// Normalize to E.164: strip spaces/dashes/parens, ensure leading "+"
+// Normalize to E.164-ish: strip non-digits except leading +, ensure leading "+"
 function normalizePhone(input: string): string {
   const trimmed = input.trim().replace(/[\s\-()]/g, "");
   if (!trimmed) return "";
-  return trimmed.startsWith("+") ? trimmed : `+${trimmed.replace(/^0+/, "")}`;
+  const withPlus = trimmed.startsWith("+") ? trimmed : `+${trimmed.replace(/^0+/, "")}`;
+  return withPlus;
+}
+
+// Derive a deterministic synthetic email from the normalized phone.
+// Users never see or type this — we use Supabase Auth's email/password under the hood,
+// but the UI is phone + password only. Domain is reserved-style to avoid real delivery.
+function phoneToSyntheticEmail(phone: string): string {
+  const digits = phone.replace(/\D/g, "");
+  return `${digits}@phone.local`;
 }
 
 function AuthPage() {
@@ -48,26 +57,44 @@ function AuthPage() {
     const err = validate();
     if (err) { toast.error(err); return; }
     setBusy(true);
+    const normalized = normalizePhone(phone);
     const { error } = await supabase.auth.signUp({
-      phone: normalizePhone(phone),
+      email: phoneToSyntheticEmail(normalized),
       password,
+      options: {
+        data: { phone: normalized, username: normalized, full_name: normalized },
+      },
     });
     setBusy(false);
-    if (error) toast.error(error.message);
-    else { toast.success("Account created!"); navigate({ to: "/play" }); }
+    if (error) {
+      const msg = /already registered|already exists/i.test(error.message)
+        ? "An account with this phone already exists. Try signing in."
+        : error.message;
+      toast.error(msg);
+      return;
+    }
+    toast.success("Account created!");
+    navigate({ to: "/play" });
   }
 
   async function handleSignIn() {
     const err = validate();
     if (err) { toast.error(err); return; }
     setBusy(true);
+    const normalized = normalizePhone(phone);
     const { error } = await supabase.auth.signInWithPassword({
-      phone: normalizePhone(phone),
+      email: phoneToSyntheticEmail(normalized),
       password,
     });
     setBusy(false);
-    if (error) toast.error(error.message);
-    else navigate({ to: "/play" });
+    if (error) {
+      const msg = /invalid login credentials/i.test(error.message)
+        ? "Incorrect phone or password."
+        : error.message;
+      toast.error(msg);
+      return;
+    }
+    navigate({ to: "/play" });
   }
 
   return (
@@ -114,7 +141,7 @@ function AuthPage() {
           </TabsContent>
         </Tabs>
 
-        <p className="mt-4 text-xs text-center text-muted-foreground">Include your country code, e.g. +254 for Kenya.</p>
+        <p className="mt-4 text-xs text-center text-muted-foreground">Include your country code, e.g. +254 for Kenya. No SMS required.</p>
       </div>
     </div>
   );
