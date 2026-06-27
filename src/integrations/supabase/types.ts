@@ -109,12 +109,25 @@ export type Database = {
       [_ in never]: never
     }
     Functions: {
-      has_role: {
-        Args: {
-          _role: Database["public"]["Enums"]["app_role"]
-          _user_id: string
-        }
-        Returns: boolean
+      leaderboard_big_wins: {
+        Args: never
+        Returns: {
+          cashed_out_at: number
+          created_at: string
+          display_name: string
+          id: string
+          payout: number
+          username: string
+        }[]
+      }
+      leaderboard_top_profit: {
+        Args: never
+        Returns: {
+          display_name: string
+          profit: number
+          user_id: string
+          username: string
+        }[]
       }
       place_bet: { Args: { _bet: number }; Returns: number }
       settle_round: {
