@@ -99,10 +99,22 @@ export function PlaneGame() {
       setMultiplier(rounded);
       if (rounded >= crashRef.current) {
         clearTimers();
-        endRound(null);
+        endRound(cashedRef.current);
       }
     }, TICK_MS);
   }, [clearTimers]);
+
+  async function settleBet(cashedAt: number | null, crash: number) {
+    const { error } = await supabase.rpc("settle_round", {
+      _bet: stakedRef.current,
+      _crash: crash,
+      _cashed: cashedAt as number,
+    });
+    if (error) toast.error(error.message);
+    qc.invalidateQueries({ queryKey: ["wallet"] });
+    qc.invalidateQueries({ queryKey: ["history"] });
+    qc.invalidateQueries({ queryKey: ["leaderboard"] });
+  }
 
   async function endRound(cashedAt: number | null) {
     clearTimers();
@@ -110,20 +122,14 @@ export function PlaneGame() {
     setCrashPoint(crash);
     setHistory((h) => [crash, ...h].slice(0, 24));
 
-    if (cashedAt != null) setPhase("cashed");
-    else setPhase("crashed");
+    // "cashed" only if the player cashed AND it was before the crash
+    setPhase(cashedAt != null && cashedAt < crash ? "cashed" : "crashed");
 
-    if (hasBetRef.current) {
-      const { error } = await supabase.rpc("settle_round", {
-        _bet: stakedRef.current,
-        _crash: crash,
-        _cashed: cashedAt as number,
-      });
-      if (error) toast.error(error.message);
-      qc.invalidateQueries({ queryKey: ["wallet"] });
-      qc.invalidateQueries({ queryKey: ["history"] });
-      qc.invalidateQueries({ queryKey: ["leaderboard"] });
+    // Settle only if not already settled at cash-out moment
+    if (hasBetRef.current && cashedAt == null) {
+      await settleBet(null, crash);
     }
+    hasBetRef.current = false;
 
     window.setTimeout(startBetting, RESULT_MS);
   }
@@ -151,9 +157,20 @@ export function PlaneGame() {
 
   function cashOut() {
     if (phase !== "flying" || !hasBetRef.current || cashedRef.current != null) return;
-    cashedRef.current = multiplier;
-    endRound(multiplier);
+    const cashed = multiplier;
+    cashedRef.current = cashed;
+
+    // Extend the crash so the plane keeps flying a bit after cash-out, then flies away.
+    // Extra is random in [0.05, 0.39] — i.e. just under 1.4x above cash-out.
+    const extra = Math.round((0.05 + Math.random() * 0.34) * 100) / 100;
+    crashRef.current = Math.max(crashRef.current, Math.round((cashed + extra) * 100) / 100);
+
+    // Settle immediately with the cash-out multiplier so the wallet updates now.
+    settleBet(cashed, crashRef.current);
+    hasBetRef.current = false;
+    toast.success(`Cashed out @ ${cashed.toFixed(2)}x`);
   }
+
 
   // plane position
   const progress = Math.min(1, Math.log(Math.max(1, multiplier)) / Math.log(10));
